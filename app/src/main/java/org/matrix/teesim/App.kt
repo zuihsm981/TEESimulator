@@ -168,7 +168,10 @@ object App {
             // no-ops from 34 on). So the set of installed apps is only ever re-read here, on a
             // config change, and at daemon start.
             KeyAdmin.onRescan = { resolveAndPush() }
-            startUsagePoll()
+            // Usage poll (every USAGE_POLL_MS) DISABLED (option B): the WebUI /packages pre-poll in
+            // KeyAdmin still refreshes usage data on demand, so the Scope picker keeps working; this
+            // only removes the 15s background cycle and its control frames. Re-enable by restoring.
+            // startUsagePoll()
 
             SystemLogger.info("Daemon initialised; entering main loop")
             Looper.loop()
@@ -409,7 +412,10 @@ object App {
             UsageStore.applyLibSample(uid, token, current, lastUsedEpoch)
             recorded++
         }
-        SystemLogger.info("usage poll: ${apps.length()} uid(s) reported, $recorded merged")
+        // Log closed on purpose: this 15s info line (pid=TID of the teesim-usage-poll thread) was
+        // considered noisy. The poll itself still runs — only the per-cycle log line is suppressed.
+        // Re-enable by deleting the comment if it is ever needed for debugging.
+        // SystemLogger.info("usage poll: ${apps.length()} uid(s) reported, $recorded merged")
     }
 
     /**
