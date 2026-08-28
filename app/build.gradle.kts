@@ -47,7 +47,8 @@ android {
 
     defaultConfig {
         applicationId = "org.matrix.teesim"
-        minSdk = 29        targetSdk = 36
+        minSdk = 29        
+        targetSdk = 36
         versionCode = gitCommitCount
         versionName = verName
         externalNativeBuild {
