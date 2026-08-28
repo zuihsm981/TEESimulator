@@ -6,6 +6,23 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      abi:
+        description: 'Target ABI (both are 64-bit: arm64-v8a for real devices, x86_64 for emulators/Chromebooks)'
+        type: choice
+        options:
+          - both
+          - arm64-v8a
+          - x86_64
+        default: both
+      build_release:
+        description: 'Build the Release variant'
+        type: boolean
+        default: true
+      build_debug:
+        description: 'Build the Debug variant'
+        type: boolean
+        default: true
 
 jobs:
   module:
@@ -42,9 +59,34 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # Resolve the ABI selection once, here, so the Rust target setup and the Gradle build agree.
+      # On push/PR triggers (no inputs) the default is 64-bit, matching the project's design.
+      - name: Resolve build options
+        id: opts
+        run: |
+          abi="${{ inputs.abi }}"
+          build_rel="${{ inputs.build_release }}"
+          build_dbg="${{ inputs.build_debug }}"
+          # push/PR: inputs.* are empty → defaults (both ABIs, both variants), matching the old behaviour.
+          [ -z "$abi" ] && abi="both"
+          [ -z "$build_rel" ] && build_rel="true"
+          [ -z "$build_dbg" ] && build_dbg="true"
+          case "$abi" in
+            arm64-v8a) abis="arm64-v8a" ;;
+            x86_64)    abis="x86_64" ;;
+            *)         abis="arm64-v8a,x86_64" ;;
+          esac
+          echo "abis=$abis" >> "$GITHUB_OUTPUT"
+          echo "build_release=$build_rel" >> "$GITHUB_OUTPUT"
+          echo "build_debug=$build_dbg" >> "$GITHUB_OUTPUT"
+          echo "Resolved: abi=$abi → abis=$abis; release=$build_rel debug=$build_dbg"
+
       - name: Set up Rust
         run: |
-          rustup target add aarch64-linux-android x86_64-linux-android
+          # Install only the Rust targets the selected ABI needs (both are 64-bit).
+          abis="${{ steps.opts.outputs.abis }}"
+          if echo "$abis" | grep -q 'arm64-v8a'; then rustup target add aarch64-linux-android; fi
+          if echo "$abis" | grep -q 'x86_64';    then rustup target add x86_64-linux-android; fi
           # Pinned for reproducibility. cargo-ndk 4 sets bindgen's NDK-sysroot clang args by default,
           # which rust/build.sh (openssl-sys bindgens BoringSSL) relies on.
           cargo install cargo-ndk --version 4.1.2 --locked
@@ -70,25 +112,42 @@ jobs:
       - name: Build the module
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
-        run: ./gradlew zipRelease zipDebug
+        run: |
+          set -euo pipefail
+          tasks=()
+          if [ "${{ steps.opts.outputs.build_release }}" = "true" ]; then tasks+=("zipRelease"); fi
+          if [ "${{ steps.opts.outputs.build_debug }}" = "true" ]; then tasks+=("zipDebug"); fi
+          if [ ${#tasks[@]} -eq 0 ]; then
+            echo "No variant selected; defaulting to zipRelease"
+            tasks+=("zipRelease")
+          fi
+          echo "Building: ${tasks[*]} (abis=${{ steps.opts.outputs.abis }})"
+          ./gradlew "${tasks[@]}" -PabiFilters="${{ steps.opts.outputs.abis }}"
 
       # upload-artifact re-zips whatever it is given on download, so handing it the built module zip
       # yields a zip-of-a-zip that has to be unpacked twice before flashing. Unpack each variant and
       # upload its contents, so the downloaded artifact is a single, directly-flashable module. Release
-      # and Debug go up as separate artifacts, each named after its build.
+      # and Debug go up as separate artifacts, each named after its build — but only the variants that
+      # were actually built, so a dispatch that selects a single variant does not fail on a missing one.
       - name: Stage the module artifacts
         id: artifacts
         run: |
           set -euo pipefail
-          rel=$(ls out/TEESimulator-*-Release.zip)
-          dbg=$(ls out/TEESimulator-*-Debug.zip)
-          mkdir -p artifact-release artifact-debug
-          unzip -q "$rel" -d artifact-release
-          unzip -q "$dbg" -d artifact-debug
-          echo "release=$(basename "$rel" .zip)" >> "$GITHUB_OUTPUT"
-          echo "debug=$(basename "$dbg" .zip)" >> "$GITHUB_OUTPUT"
+          if [ "${{ steps.opts.outputs.build_release }}" = "true" ]; then
+            rel=$(ls out/TEESimulator-*-Release.zip)
+            mkdir -p artifact-release
+            unzip -q "$rel" -d artifact-release
+            echo "release=$(basename "$rel" .zip)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ steps.opts.outputs.build_debug }}" = "true" ]; then
+            dbg=$(ls out/TEESimulator-*-Debug.zip)
+            mkdir -p artifact-debug
+            unzip -q "$dbg" -d artifact-debug
+            echo "debug=$(basename "$dbg" .zip)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload the release module
+        if: ${{ steps.artifacts.outputs.release != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifacts.outputs.release }}
@@ -96,6 +155,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the debug module
+        if: ${{ steps.artifacts.outputs.debug != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifacts.outputs.debug }}
@@ -122,11 +182,15 @@ jobs:
           # Drop the -<hash> segment sitting before -Release/-Debug so the release assets read
           # TEESimulator-<ver>-<count>-Release.zip, matching module/update.json's zipUrl.
           for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
+            [ -f "$z" ] || continue
             clean=$(echo "$z" | sed -E 's/-[0-9a-f]{7,}-(Release|Debug)\.zip$/-\1.zip/')
             [ "$z" = "$clean" ] || mv "$z" "$clean"
           done
-          rel=$(ls out/TEESimulator-*-Release.zip)
-          dbg=$(ls out/TEESimulator-*-Debug.zip)
+          # Collect only the variants that were built.
+          assets=()
+          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
+            [ -f "$z" ] && assets+=("$z")
+          done
           # `%s` argument, never the format string, so a `%` anywhere in the changelog stays literal.
           notes=$(printf '# TEESimulator %s\n\n%s\n' "${TAG}" "$(cat module/changelog.md)")
           # Recreated rather than edited so a re-run replaces the assets instead of appending a second
@@ -136,7 +200,7 @@ jobs:
             --latest \
             --title "TEESimulator ${TAG}" \
             --notes "$notes" \
-            "$rel" "$dbg"
+            "${assets[@]}"
 
       # --- canary distribution (dev push) --------------------------------------------------------
       #
@@ -175,6 +239,11 @@ jobs:
           Only the five most recent canaries are kept.
           EOF
           )
+          # Collect only the variants that were built (a dispatch may select a single one).
+          assets=()
+          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
+            [ -f "$z" ] && assets+=("$z")
+          done
           # Recreate rather than edit so a re-run replaces the build instead of appending assets.
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" \
@@ -182,8 +251,7 @@ jobs:
             --target "${{ github.sha }}" \
             --title "TEESimulator canary ${code}" \
             --notes "$notes" \
-            out/TEESimulator-*-Release.zip \
-            out/TEESimulator-*-Debug.zip
+            "${assets[@]}"
 
       # Five is enough to bisect a regression; sorted by version code (commit count, monotonic), not
       # date, which reruns and reverts can disorder.
