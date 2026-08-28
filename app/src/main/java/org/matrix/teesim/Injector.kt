@@ -5,7 +5,7 @@ import android.os.IBinder
 import android.os.ServiceManager
 import java.io.File
 
-/*
+/**
  * Finds the keystore daemon and drives the packaged `inject` binary to load the right interceptor
  * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
  * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so.
