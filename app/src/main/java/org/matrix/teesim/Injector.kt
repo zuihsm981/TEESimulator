@@ -10,26 +10,22 @@ import java.io.File
  * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
  * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so.
  *
- * **Event-driven, not polled.** The previous design scanned `/proc/*/cmdline` every 2 s looking for
+ * Event-driven, not polled. The previous design scanned `/proc/<pid>/cmdline` every 2 s looking for
  * the keystore pid. This one blocks on [ServiceManager.waitForService] until the keystore binder
  * appears, registers a binder [IBinder.DeathRecipient] on it, injects once, and then parks on a
  * monitor until the recipient fires — i.e. until the keystore process dies. On death it clears the
  * stale pid and loops back to `waitForService` for the respawn. There is no `/proc` scanning loop and
  * no sleep-based polling while a keystore is live and injected; the only `findPid` call is the single
  * one made after a service (re)appears, to turn the binder handle into a pid for the inject binary.
- *
  * The only sleeps left are: a 2 s back-off on the no-service / inject-failed branch (a fault-retry,
  * not a watch poll), and the existing ~12 s `confirmAsync` hello wait (unchanged).
  */
 class Injector(private val moduleDir: File) {
-
     private val api = Build.VERSION.SDK_INT
     private val procName = if (api >= 31) "keystore2" else "keystore"
     private val libName = if (api >= 31) "libteesim_keymint.so" else "libteesim_keystore.so"
-
     private val abi: String =
         Build.SUPPORTED_ABIS?.firstOrNull() ?: DeviceProps.prop("ro.product.cpu.abi", "arm64-v8a")
-
     private val injectBin = File(moduleDir, "$abi/inject")
     private val libFile = File(moduleDir, "$abi/$libName")
 
@@ -44,7 +40,6 @@ class Injector(private val moduleDir: File) {
     // Wakes the loop when the live keystore service dies so it can re-enter waitForService for the
     // respawn. Parked on only after a successful inject; a successful inject never polls.
     private val deathLock = Object()
-
     private val deathRecipient = object : IBinder.DeathRecipient {
         override fun binderDied() {
             // Fires on a binder thread when the keystore process hosting the service exits. Wake the
@@ -52,8 +47,7 @@ class Injector(private val moduleDir: File) {
             SystemLogger.info("injector: $procName service died; awaiting respawn")
             SystemLogger.debug("injector: binderDied() on thread=${Thread.currentThread().name}; clearing lastPid=$lastPid")
             lastPid = -1
-            synchronized(deathLock) {
-                deathLock.notifyAll()
+            synchronized(deathLock) {                deathLock.notifyAll()
                 SystemLogger.debug("injector: deathLock notified; loop will re-enter waitForService")
             }
         }
@@ -65,7 +59,7 @@ class Injector(private val moduleDir: File) {
         if (!injectBin.exists() || !libFile.exists()) {
             SystemLogger.error(
                 "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
-                    "under ${moduleDir.absolutePath}/$abi"
+                        "under ${moduleDir.absolutePath}/$abi"
             )
         }
         injectBin.setExecutable(true, false)
@@ -102,7 +96,6 @@ class Injector(private val moduleDir: File) {
         }
         SystemLogger.debug("injector: loop exiting (running=$running)")
     }
-
     /**
      * Link the death recipient, resolve the pid once, inject, and confirm. Returns true when the
      * interceptor is live in [lastPid] (the caller then parks on the death event); false on any fault
@@ -121,9 +114,11 @@ class Injector(private val moduleDir: File) {
 
         val pid = findPid(procName)
         SystemLogger.debug("injector: findPid($procName) -> $pid (lastPid=$lastPid)")
+
         // Tell the log tail which process to capture, so the Logs panel shows the target keystore's
         // own output — even before we manage to inject it.
         LogTail.targetPid = if (pid > 0) pid else -1
+
         if (pid <= 0) {
             SystemLogger.warning("injector: $procName service up but pid not found; will retry")
             return false
@@ -150,8 +145,7 @@ class Injector(private val moduleDir: File) {
             // lastPid is cleared by the death recipient; any spurious wake re-checks and parks again.
             while (running && lastPid != -1) {
                 deathLock.wait()
-            }
-        }
+            }        }
         SystemLogger.debug("injector: parkUntilDeath exit (lastPid=$lastPid, running=$running); re-entering waitForService")
     }
 
@@ -179,36 +173,34 @@ class Injector(private val moduleDir: File) {
         }
     }
 
-    /** The control-channel hello is the real proof the lib loaded and bound the control socket. Warn
-     * (don't re-inject — that risks double-hooking) if it never arrives. */
+    /**
+     * The control-channel hello is the real proof the lib loaded and bound the control socket. Warn
+     * (don't re-inject — that risks double-hooking) if it never arrives.
+     */
     private fun confirmAsync(pid: Int) {
         Thread({
-                for (i in 0 until 24) { // ~12s
-                    if (Control.libApi != 0) return@Thread
-                    sleep(500)
-                }
-                SystemLogger.warning(
-                    "injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
-                        "(SELinux on the control socket? look for 'avc: denied' in logcat)"
-                )
-            }, "teesim-inject-confirm")
-            .apply {
-                isDaemon = true
-                start()
+            for (i in 0 until 24) { // ~12s
+                if (Control.libApi != 0) return@Thread
+                sleep(500)
             }
+            SystemLogger.warning(
+                "injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
+                        "(SELinux on the control socket? look for 'avc: denied' in logcat)"
+            )
+        }, "teesim-inject-confirm").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     private fun inject(pid: Int): Boolean {
-        return try {
-            val proc =
-                ProcessBuilder(
-                        injectBin.absolutePath,
-                        pid.toString(),
-                        libFile.absolutePath,
-                        "entry",
-                    )
-                    .redirectErrorStream(true)
-                    .start()
+        return try {            val proc = ProcessBuilder(
+                injectBin.absolutePath,
+                pid.toString(),
+                libFile.absolutePath,
+                "entry",
+            ).redirectErrorStream(true).start()
+            
             val output = proc.inputStream.bufferedReader().readText()
             val code = proc.waitFor()
             if (code != 0) SystemLogger.warning("injector: inject exit=$code output=$output")
@@ -222,16 +214,14 @@ class Injector(private val moduleDir: File) {
     /** Return the pid whose /proc/<pid>/cmdline basename matches [name], else -1. */
     private fun findPid(name: String): Int {
         val proc = File("/proc")
-        val entries =
-            proc.listFiles { f -> f.isDirectory && f.name.all { it.isDigit() } } ?: return -1
+        val entries = proc.listFiles { f -> f.isDirectory && f.name.all { it.isDigit() } } ?: return -1
         for (dir in entries) {
             val cmdlineFile = File(dir, "cmdline")
-            val cmd =
-                try {
-                    cmdlineFile.readBytes()
-                } catch (e: Exception) {
-                    continue
-                }
+            val cmd = try {
+                cmdlineFile.readBytes()
+            } catch (e: Exception) {
+                continue
+            }
             if (cmd.isEmpty()) continue
             val end = cmd.indexOf(0.toByte()).let { if (it < 0) cmd.size else it }
             val arg0 = String(cmd, 0, end)
