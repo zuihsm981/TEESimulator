@@ -27,8 +27,7 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
         val byteOut = ByteArrayOutputStream()
         execOperations.exec {
             workingDir = currentWorkingDir
-            // FIX: use Regex("\\s+") instead of invalid "\s" escape
-            commandLine = command.split(Regex("\\s+"))
+            commandLine = command.split("\\s".toRegex())
             standardOutput = byteOut
         }
         return String(byteOut.toByteArray()).trim()
@@ -54,14 +53,8 @@ android {
         versionName = verName
         externalNativeBuild {
             cmake {
-                // The interceptors are 64-bit only (keystore2 is 64-bit everywhere): arm64-v8a for real
-                // devices, x86_64 for emulators/Chromebooks. Override from the CLI / CI with
-                // -PabiFilters=arm64-v8a or -PabiFilters=x86_64 to build a single ABI; a comma-separated
-                // list selects several. 32-bit ABIs are not supported (the module refuses 32-bit devices).
-                val abiFiltersProp =
-                    (project.findProperty("abiFilters") as String?)
-                        ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
-                abiFilters += (abiFiltersProp ?: listOf("arm64-v8a", "x86_64"))
+                // The interceptors are 64-bit only (keystore2 is 64-bit everywhere).
+                abiFilters += listOf("arm64-v8a", "x86_64")
                 // Match package.sh: build the injector, the UDS client, the daemon's log reader,
                 // and both interceptors; the static BoringSSL `crypto` target builds transitively
                 // for keystore.
@@ -103,10 +96,13 @@ android {
 
     lint { abortOnError = false }
 
-    // REMOVED the redundant top-level externalNativeBuild block – the one inside defaultConfig already
-    // sets abiFilters and targets. The top-level block is only needed to specify the CMake path,
-    // which we do not require here (AGP picks up the root CMakeLists.txt automatically).
-} // <-- end android block
+    externalNativeBuild {
+        cmake {
+            path = rootProject.file("CMakeLists.txt")
+            buildStagingDirectory = layout.buildDirectory.get().asFile
+        }
+    }
+}
 
 dependencies {
     compileOnly(project(":stub"))
@@ -137,9 +133,10 @@ tasks.register<Copy>("dex") {
 // executable (AGP's per-variant native build), and the module/ tree (scripts +
 // WebUI). The interceptors are 64-bit only, so binaries live under <abi>/ at the
 // module root, exactly where module/daemon and module/customize.sh expect them.
+
 // Per-root-manager install tasks target adb. When several devices are attached, pick
 // one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so
-// ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
+//     ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
 // targets that device with no extra flags.
 fun adb(vararg args: String): List<String> = listOf("adb", *args)
 
@@ -176,7 +173,7 @@ val checkWebrootJs =
                     .start()
                 val msg = p.inputStream.bufferedReader().readText().trim()
                 if (p.waitFor() != 0) {
-                    val where = msg.lines().firstOrNull()?.replace("[stdin] ", f.name) ?: "syntax error"
+                    val where = msg.lines().firstOrNull()?.replace("[stdin]", f.name) ?: "syntax error"
                     failures.add("  ${f.relativeTo(rootProject.projectDir)}: $where")
                 }
             }
@@ -210,8 +207,10 @@ androidComponents {
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
                 group = "TEESimulator Module Packaging"
                 description = "Prepares all files for the ${variant.name} module zip."
+
                 // Reject a WebUI JS syntax error before it ships (no-op when node is absent).
                 dependsOn(checkWebrootJs)
+
                 if (isDebug) {
                     dependsOn("package${capitalized}")
                 } else {
@@ -221,6 +220,7 @@ androidComponents {
                 // is only collected under intermediates/cmake by externalNativeBuild.
                 dependsOn("strip${capitalized}DebugSymbols")
                 dependsOn("externalNativeBuild${capitalized}")
+
                 if (isDebug) {
                     // Debug has no R8 pass; ship the packaged APK. module/daemon falls
                     // back to service.apk when classes.dex is absent.
@@ -238,6 +238,7 @@ androidComponents {
                         include("classes.dex")
                     }
                 }
+
                 // The stripped interceptor libraries and the daemon's log reader, keeping their
                 // <abi>/ layout; the runtime stubs (libcrypto/libbinder/libutils) stay out of the zip.
                 from(strippedLibs) {
@@ -247,21 +248,26 @@ androidComponents {
                         "**/libteesim_logcat.so",
                     )
                 }
+
                 // The injector executable and the WebUI's admin-socket client, one per <abi>/.
                 from(cmakeObj) { include("**/inject", "**/teesim-uds") }
+
                 // The module scripts and WebUI (service.sh, daemon, customize.sh,
                 // sepolicy.rule, config.default.json, webroot/); module.prop is
                 // templated separately below.
                 val sourceModuleDir = rootProject.projectDir.resolve("module")
                 from(sourceModuleDir) { exclude("module.prop") }
+
                 // module.prop with git-derived version fields filled in.
                 from(sourceModuleDir) {
                     include("module.prop")
                     expand(
                         "REPLACEMEVERCODE" to gitCommitCount.toString(),
-                        "REPLACEMEVER" to "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
+                        "REPLACEMEVER" to
+                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
                     )
                 }
+
                 into(tempModuleDir)
             }
 
@@ -281,7 +287,8 @@ androidComponents {
             val pushTask =
                 tasks.register<Exec>("push${rootProvider}Module${capitalized}") {
                     group = "TEESimulator Module Installation"
-                    description = "Pushes the ${variant.name} module zip to the device for $rootProvider."
+                    description =
+                        "Pushes the ${variant.name} module zip to the device for $rootProvider."
                     dependsOn(zipTask)
                     commandLine(
                         adb(
@@ -291,6 +298,7 @@ androidComponents {
                         )
                     )
                 }
+
             val installTask =
                 tasks.register<Exec>("install${rootProvider}${capitalized}") {
                     group = "TEESimulator Module Installation"
@@ -298,6 +306,7 @@ androidComponents {
                     dependsOn(pushTask)
                     commandLine(adb("shell", "su", "-c", "$installCli /data/local/tmp/$zipFileName"))
                 }
+
             tasks.register<Exec>("install${rootProvider}AndReboot${capitalized}") {
                 group = "TEESimulator Module Installation"
                 description = "Installs the ${variant.name} module via $rootProvider and reboots."
