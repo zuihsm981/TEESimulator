@@ -27,7 +27,8 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
         val byteOut = ByteArrayOutputStream()
         execOperations.exec {
             workingDir = currentWorkingDir
-            commandLine = command.split("\s".toRegex())
+            // FIX: use Regex("\\s+") instead of invalid "\s" escape
+            commandLine = command.split(Regex("\\s+"))
             standardOutput = byteOut
         }
         return String(byteOut.toByteArray()).trim()
@@ -47,7 +48,7 @@ android {
 
     defaultConfig {
         applicationId = "org.matrix.teesim"
-        minSdk = 29        
+        minSdk = 29
         targetSdk = 36
         versionCode = gitCommitCount
         versionName = verName
@@ -97,24 +98,15 @@ android {
         // Keep the interceptor's symbols so a native/TA crash symbolicates to file:line in the
         // tombstone (paired with the Rust profile's debug=true). AGP otherwise strips them, and the
         // module packaging reads the stripped output.
-        jniLibs { keepDebugSymbols += "**/libteesim_keymint.so" }    }
+        jniLibs { keepDebugSymbols += "**/libteesim_keymint.so" }
+    }
 
     lint { abortOnError = false }
 
-    externalNativeBuild {
-        cmake {
-            // The interceptors are 64-bit only by default (keystore2 is 64-bit everywhere).
-            // Override from the CLI / CI with -PabiFilters=armeabi-v7a,x86 for a 32-bit build
-            // (experimental: the module refuses 32-bit-only devices at install, and the Rust TA
-            // may not build for 32-bit). A comma-separated list selects several ABIs at once.
-            val abiFiltersProp =
-                (project.findProperty("abiFilters") as String?)
-                    ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
-            abiFilters += (abiFiltersProp ?: listOf("arm64-v8a", "x86_64"))
-            targets += listOf("inject", "teesim-uds", "teesim_logcat", "teesim_keymint", "teesim_keystore")
-        }
-    }
-} // <-- 修复：添加了缺失的闭合大括号，结束 android 块
+    // REMOVED the redundant top-level externalNativeBuild block – the one inside defaultConfig already
+    // sets abiFilters and targets. The top-level block is only needed to specify the CMake path,
+    // which we do not require here (AGP picks up the root CMakeLists.txt automatically).
+} // <-- end android block
 
 dependencies {
     compileOnly(project(":stub"))
@@ -127,7 +119,7 @@ dependencies {
 // Extract classes.dex from the R8-shrunken release output into build/teesim/.
 // app_process runs this dex directly. Sourced from the R8 intermediate (not the
 // packaged APK) so a plain `:app:dex` does not drag in the native build.
-tasks.register<Copy>("dex") { // <-- 修复：移除了泛型和字符串中的多余空格
+tasks.register<Copy>("dex") {
     group = "teesim"
     description = "Builds the daemon and copies classes.dex to build/teesim/."
     dependsOn("minifyReleaseWithR8")
@@ -146,7 +138,8 @@ tasks.register<Copy>("dex") { // <-- 修复：移除了泛型和字符串中的�
 // WebUI). The interceptors are 64-bit only, so binaries live under <abi>/ at the
 // module root, exactly where module/daemon and module/customize.sh expect them.
 // Per-root-manager install tasks target adb. When several devices are attached, pick
-// one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so//     ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
+// one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so
+// ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
 // targets that device with no extra flags.
 fun adb(vararg args: String): List<String> = listOf("adb", *args)
 
@@ -156,7 +149,7 @@ fun adb(vararg args: String): List<String> = listOf("adb", *args)
 // This runs `node --check` on every module/webroot JS file, but only when node is installed: a build on
 // a machine without node logs a notice and proceeds, so node is a convenience, not a hard requirement.
 val checkWebrootJs =
-    tasks.register("checkWebrootJs") { // <-- 修复：移除了多余空格
+    tasks.register("checkWebrootJs") {
         group = "TEESimulator Module Packaging"
         description = "Syntax-checks the WebUI JavaScript with `node --check` when node is available."
         val jsDir = rootProject.projectDir.resolve("module/webroot/js")
@@ -176,7 +169,6 @@ val checkWebrootJs =
             // passes real syntax errors, so feed each file on stdin with an explicit module type —
             // that form exits non-zero (with a "[stdin]:LINE" location) on a genuine error.
             val failures = mutableListOf<String>()
-            // <-- 修复：将 "& &" 修复为 "&&"，并移除了 "js " 末尾的空格
             jsDir.walk().filter { it.isFile && it.extension == "js" }.forEach { f ->
                 val p = ProcessBuilder("node", "--input-type=module", "--check")
                     .redirectInput(f)
@@ -184,7 +176,6 @@ val checkWebrootJs =
                     .start()
                 val msg = p.inputStream.bufferedReader().readText().trim()
                 if (p.waitFor() != 0) {
-                    // <-- 修复：将 "r eplace" 修复为 "replace"
                     val where = msg.lines().firstOrNull()?.replace("[stdin] ", f.name) ?: "syntax error"
                     failures.add("  ${f.relativeTo(rootProject.projectDir)}: $where")
                 }
@@ -195,15 +186,16 @@ val checkWebrootJs =
             logger.lifecycle("checkWebrootJs: all WebUI JS files parse OK")
         }
     }
+
 androidComponents {
     onVariants(selector().all()) { variant ->
         val capitalized = variant.name.replaceFirstChar { it.uppercase() }
         val isDebug = variant.buildType == "debug"
-        
+
         // Stage per variant so debug and release never clobber each other.
         val tempModuleDir = layout.buildDirectory.dir("module/${variant.name}")
         val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
-        
+
         // Where AGP leaves this variant's native build: stripped .so under
         // stripped_native_libs, and the injector executable (never stripped or
         // packaged by AGP) only under intermediates/cmake.
@@ -212,7 +204,7 @@ androidComponents {
                 "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
             )
         val cmakeObj = layout.buildDirectory.dir("intermediates/cmake/${variant.name}/obj")
-        
+
         // Stage every module file. Sync clears stale files from previous runs.
         val prepareModuleFilesTask =
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
@@ -244,7 +236,8 @@ androidComponents {
                         )
                     ) {
                         include("classes.dex")
-                    }                }
+                    }
+                }
                 // The stripped interceptor libraries and the daemon's log reader, keeping their
                 // <abi>/ layout; the runtime stubs (libcrypto/libbinder/libutils) stay out of the zip.
                 from(strippedLibs) {
@@ -271,7 +264,7 @@ androidComponents {
                 }
                 into(tempModuleDir)
             }
-            
+
         // Zip the staged module into out/.
         val zipTask =
             tasks.register<Zip>("zip${capitalized}") {
@@ -282,7 +275,7 @@ androidComponents {
                 destinationDirectory.set(rootProject.rootDir.resolve("out"))
                 from(tempModuleDir)
             }
-            
+
         // Per-root-manager install tasks: push the zip and let the manager flash it.
         fun createInstallTasks(rootProvider: String, installCli: String) {
             val pushTask =
@@ -293,7 +286,8 @@ androidComponents {
                     commandLine(
                         adb(
                             "push",
-                            zipTask.get().archiveFile.get().asFile.absolutePath,                            "/data/local/tmp",
+                            zipTask.get().archiveFile.get().asFile.absolutePath,
+                            "/data/local/tmp",
                         )
                     )
                 }
@@ -311,7 +305,7 @@ androidComponents {
                 commandLine(adb("reboot"))
             }
         }
-        
+
         createInstallTasks("Magisk", "magisk --install-module")
         createInstallTasks("Ksu", "ksud module install")
         createInstallTasks("Apatch", "/data/adb/apd module install")
