@@ -53,8 +53,14 @@ android {
         versionName = verName
         externalNativeBuild {
             cmake {
-                // The interceptors are 64-bit only (keystore2 is 64-bit everywhere).
-                abiFilters += listOf("arm64-v8a", "x86_64")
+                // The interceptors are 64-bit only (keystore2 is 64-bit everywhere): arm64-v8a for real
+                // devices, x86_64 for emulators/Chromebooks. Override from the CLI / CI with
+                // -PabiFilters=arm64-v8a or -PabiFilters=x86_64 to build a single ABI; a comma-separated
+                // list selects several. 32-bit ABIs are not supported (the module refuses 32-bit devices).
+                val abiFiltersProp =
+                    (project.findProperty("abiFilters") as String?)
+                        ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+                abiFilters += (abiFiltersProp ?: listOf("arm64-v8a", "x86_64"))
                 // Match package.sh: build the injector, the UDS client, the daemon's log reader,
                 // and both interceptors; the static BoringSSL `crypto` target builds transitively
                 // for keystore.
@@ -98,11 +104,17 @@ android {
 
     externalNativeBuild {
         cmake {
-            path = rootProject.file("CMakeLists.txt")
-            buildStagingDirectory = layout.buildDirectory.get().asFile
+            // The interceptors are 64-bit only by default (keystore2 is 64-bit everywhere).
+            // Override from the CLI / CI with -PabiFilters=armeabi-v7a,x86 for a 32-bit build
+            // (experimental: the module refuses 32-bit-only devices at install, and the Rust TA
+            // may not build for 32-bit). A comma-separated list selects several ABIs at once.
+            val abiFiltersProp =
+                (project.findProperty("abiFilters") as String?)
+                    ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            abiFilters += (abiFiltersProp ?: listOf("arm64-v8a", "x86_64"))
+            targets += listOf("inject", "teesim-uds", "teesim_logcat", "teesim_keymint", "teesim_keystore")
         }
     }
-}
 
 dependencies {
     compileOnly(project(":stub"))
