@@ -48,8 +48,17 @@ object LogTail {
      * Load libteesim_logcat.so from [nativeLib] and start the reader on its own daemon thread. Called
      * once, from [App], with the module's per-ABI library path. If the library is missing or fails to
      * load the Logs panel simply stays empty; the daemon is otherwise unaffected.
+     *
+     * Log capture is DISABLED by design: this method now returns without loading the library or
+     * starting the reader thread, so logd is never read, the in-memory ring stays empty, and no
+     * teesim*.log files are ever written (the WebUI Logs panel will show nothing). The native
+     * Java_org_matrix_teesim_LogTail_nativeRun in logcat/logcat.cpp is likewise stubbed to return
+     * immediately as a second layer of protection. Restore this body and that stub to re-enable.
      */
     fun start(nativeLib: File) {
+        // Log capture DISABLED — see the KDoc above.
+        return
+        /*
         if (loaded) return
         try {
             System.load(nativeLib.absolutePath)
@@ -58,8 +67,6 @@ object LogTail {
             SystemLogger.error("LogTail: cannot load ${nativeLib.absolutePath}; Logs panel disabled", e)
             return
         }
-        // The reader thread needs a place to write before it opens its files.
-        runCatching { Const.logDir.mkdirs() }
         // Push the current target pid across in case the Injector set it before the library loaded.
         runCatching { nativeSetTargetPid(targetPid) }
         // The log reader is a debugging aid; it must NEVER take the daemon down. nativeRun can still
@@ -77,6 +84,7 @@ object LogTail {
             start()
         }
         SystemLogger.info("LogTail: native log reader started (dir=${Const.logDir.absolutePath})")
+        */
     }
 
     /** Lines with seq greater than [after], up to [max], plus the cursor to poll with next. Empty (and
