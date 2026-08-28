@@ -5,22 +5,7 @@ import android.os.IBinder
 import android.os.ServiceManager
 import java.io.File
 
-/**
- * Finds the keystore daemon and drives the packaged `inject` binary to load the right interceptor
- * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
- * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so.
- *
- * **Event-driven, not polled.** The previous design scanned `/proc/*/cmdline` every 2 s looking for
- * the keystore pid. This one blocks on [ServiceManager.waitForService] until the keystore binder
- * appears, registers a binder [IBinder.DeathRecipient] on it, injects once, and then parks on a
- * monitor until the recipient fires — i.e. until the keystore process dies. On death it clears the
- * stale pid and loops back to `waitForService` for the respawn. There is no `/proc` scanning loop and
- * no sleep-based polling while a keystore is live and injected; the only `findPid` call is the single
- * one made after a service (re)appears, to turn the binder handle into a pid for the inject binary.
- *
- * The only sleeps left are: a 2 s back-off on the no-service / inject-failed branch (a fault-retry,
- * not a watch poll), and the existing ~12 s `confirmAsync` hello wait (unchanged).
- */
+
 class Injector(private val moduleDir: File) {
 
     private val api = Build.VERSION.SDK_INT
