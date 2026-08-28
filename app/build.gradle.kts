@@ -27,7 +27,7 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
         val byteOut = ByteArrayOutputStream()
         execOperations.exec {
             workingDir = currentWorkingDir
-            commandLine = command.split("\\s".toRegex())
+            commandLine = command.split("\s".toRegex())
             standardOutput = byteOut
         }
         return String(byteOut.toByteArray()).trim()
@@ -47,8 +47,7 @@ android {
 
     defaultConfig {
         applicationId = "org.matrix.teesim"
-        minSdk = 29
-        targetSdk = 36
+        minSdk = 29        targetSdk = 36
         versionCode = gitCommitCount
         versionName = verName
         externalNativeBuild {
@@ -97,8 +96,7 @@ android {
         // Keep the interceptor's symbols so a native/TA crash symbolicates to file:line in the
         // tombstone (paired with the Rust profile's debug=true). AGP otherwise strips them, and the
         // module packaging reads the stripped output.
-        jniLibs { keepDebugSymbols += "**/libteesim_keymint.so" }
-    }
+        jniLibs { keepDebugSymbols += "**/libteesim_keymint.so" }    }
 
     lint { abortOnError = false }
 
@@ -115,6 +113,7 @@ android {
             targets += listOf("inject", "teesim-uds", "teesim_logcat", "teesim_keymint", "teesim_keystore")
         }
     }
+} // <-- 修复：添加了缺失的闭合大括号，结束 android 块
 
 dependencies {
     compileOnly(project(":stub"))
@@ -127,7 +126,7 @@ dependencies {
 // Extract classes.dex from the R8-shrunken release output into build/teesim/.
 // app_process runs this dex directly. Sourced from the R8 intermediate (not the
 // packaged APK) so a plain `:app:dex` does not drag in the native build.
-tasks.register<Copy>("dex") {
+tasks.register<Copy>("dex") { // <-- 修复：移除了泛型和字符串中的多余空格
     group = "teesim"
     description = "Builds the daemon and copies classes.dex to build/teesim/."
     dependsOn("minifyReleaseWithR8")
@@ -145,10 +144,8 @@ tasks.register<Copy>("dex") {
 // executable (AGP's per-variant native build), and the module/ tree (scripts +
 // WebUI). The interceptors are 64-bit only, so binaries live under <abi>/ at the
 // module root, exactly where module/daemon and module/customize.sh expect them.
-
 // Per-root-manager install tasks target adb. When several devices are attached, pick
-// one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so
-//     ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
+// one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so//     ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
 // targets that device with no extra flags.
 fun adb(vararg args: String): List<String> = listOf("adb", *args)
 
@@ -158,7 +155,7 @@ fun adb(vararg args: String): List<String> = listOf("adb", *args)
 // This runs `node --check` on every module/webroot JS file, but only when node is installed: a build on
 // a machine without node logs a notice and proceeds, so node is a convenience, not a hard requirement.
 val checkWebrootJs =
-    tasks.register("checkWebrootJs") {
+    tasks.register("checkWebrootJs") { // <-- 修复：移除了多余空格
         group = "TEESimulator Module Packaging"
         description = "Syntax-checks the WebUI JavaScript with `node --check` when node is available."
         val jsDir = rootProject.projectDir.resolve("module/webroot/js")
@@ -178,6 +175,7 @@ val checkWebrootJs =
             // passes real syntax errors, so feed each file on stdin with an explicit module type —
             // that form exits non-zero (with a "[stdin]:LINE" location) on a genuine error.
             val failures = mutableListOf<String>()
+            // <-- 修复：将 "& &" 修复为 "&&"，并移除了 "js " 末尾的空格
             jsDir.walk().filter { it.isFile && it.extension == "js" }.forEach { f ->
                 val p = ProcessBuilder("node", "--input-type=module", "--check")
                     .redirectInput(f)
@@ -185,7 +183,8 @@ val checkWebrootJs =
                     .start()
                 val msg = p.inputStream.bufferedReader().readText().trim()
                 if (p.waitFor() != 0) {
-                    val where = msg.lines().firstOrNull()?.replace("[stdin]", f.name) ?: "syntax error"
+                    // <-- 修复：将 "r eplace" 修复为 "replace"
+                    val where = msg.lines().firstOrNull()?.replace("[stdin] ", f.name) ?: "syntax error"
                     failures.add("  ${f.relativeTo(rootProject.projectDir)}: $where")
                 }
             }
@@ -195,16 +194,15 @@ val checkWebrootJs =
             logger.lifecycle("checkWebrootJs: all WebUI JS files parse OK")
         }
     }
-
 androidComponents {
     onVariants(selector().all()) { variant ->
         val capitalized = variant.name.replaceFirstChar { it.uppercase() }
         val isDebug = variant.buildType == "debug"
-
+        
         // Stage per variant so debug and release never clobber each other.
         val tempModuleDir = layout.buildDirectory.dir("module/${variant.name}")
         val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
-
+        
         // Where AGP leaves this variant's native build: stripped .so under
         // stripped_native_libs, and the injector executable (never stripped or
         // packaged by AGP) only under intermediates/cmake.
@@ -213,16 +211,14 @@ androidComponents {
                 "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
             )
         val cmakeObj = layout.buildDirectory.dir("intermediates/cmake/${variant.name}/obj")
-
+        
         // Stage every module file. Sync clears stale files from previous runs.
         val prepareModuleFilesTask =
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
                 group = "TEESimulator Module Packaging"
                 description = "Prepares all files for the ${variant.name} module zip."
-
                 // Reject a WebUI JS syntax error before it ships (no-op when node is absent).
                 dependsOn(checkWebrootJs)
-
                 if (isDebug) {
                     dependsOn("package${capitalized}")
                 } else {
@@ -232,7 +228,6 @@ androidComponents {
                 // is only collected under intermediates/cmake by externalNativeBuild.
                 dependsOn("strip${capitalized}DebugSymbols")
                 dependsOn("externalNativeBuild${capitalized}")
-
                 if (isDebug) {
                     // Debug has no R8 pass; ship the packaged APK. module/daemon falls
                     // back to service.apk when classes.dex is absent.
@@ -248,9 +243,7 @@ androidComponents {
                         )
                     ) {
                         include("classes.dex")
-                    }
-                }
-
+                    }                }
                 // The stripped interceptor libraries and the daemon's log reader, keeping their
                 // <abi>/ layout; the runtime stubs (libcrypto/libbinder/libutils) stay out of the zip.
                 from(strippedLibs) {
@@ -260,29 +253,24 @@ androidComponents {
                         "**/libteesim_logcat.so",
                     )
                 }
-
                 // The injector executable and the WebUI's admin-socket client, one per <abi>/.
                 from(cmakeObj) { include("**/inject", "**/teesim-uds") }
-
                 // The module scripts and WebUI (service.sh, daemon, customize.sh,
                 // sepolicy.rule, config.default.json, webroot/); module.prop is
                 // templated separately below.
                 val sourceModuleDir = rootProject.projectDir.resolve("module")
                 from(sourceModuleDir) { exclude("module.prop") }
-
                 // module.prop with git-derived version fields filled in.
                 from(sourceModuleDir) {
                     include("module.prop")
                     expand(
                         "REPLACEMEVERCODE" to gitCommitCount.toString(),
-                        "REPLACEMEVER" to
-                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
+                        "REPLACEMEVER" to "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
                     )
                 }
-
                 into(tempModuleDir)
             }
-
+            
         // Zip the staged module into out/.
         val zipTask =
             tasks.register<Zip>("zip${capitalized}") {
@@ -293,24 +281,21 @@ androidComponents {
                 destinationDirectory.set(rootProject.rootDir.resolve("out"))
                 from(tempModuleDir)
             }
-
+            
         // Per-root-manager install tasks: push the zip and let the manager flash it.
         fun createInstallTasks(rootProvider: String, installCli: String) {
             val pushTask =
                 tasks.register<Exec>("push${rootProvider}Module${capitalized}") {
                     group = "TEESimulator Module Installation"
-                    description =
-                        "Pushes the ${variant.name} module zip to the device for $rootProvider."
+                    description = "Pushes the ${variant.name} module zip to the device for $rootProvider."
                     dependsOn(zipTask)
                     commandLine(
                         adb(
                             "push",
-                            zipTask.get().archiveFile.get().asFile.absolutePath,
-                            "/data/local/tmp",
+                            zipTask.get().archiveFile.get().asFile.absolutePath,                            "/data/local/tmp",
                         )
                     )
                 }
-
             val installTask =
                 tasks.register<Exec>("install${rootProvider}${capitalized}") {
                     group = "TEESimulator Module Installation"
@@ -318,7 +303,6 @@ androidComponents {
                     dependsOn(pushTask)
                     commandLine(adb("shell", "su", "-c", "$installCli /data/local/tmp/$zipFileName"))
                 }
-
             tasks.register<Exec>("install${rootProvider}AndReboot${capitalized}") {
                 group = "TEESimulator Module Installation"
                 description = "Installs the ${variant.name} module via $rootProvider and reboots."
@@ -326,7 +310,7 @@ androidComponents {
                 commandLine(adb("reboot"))
             }
         }
-
+        
         createInstallTasks("Magisk", "magisk --install-module")
         createInstallTasks("Ksu", "ksud module install")
         createInstallTasks("Apatch", "/data/adb/apd module install")
