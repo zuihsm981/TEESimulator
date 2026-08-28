@@ -10,7 +10,7 @@ import java.io.File
  * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
  * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so.
  *
- * **Event-driven, not polled.** The previous design scanned `/proc/*/cmdline` every 2 s looking for
+ * **Event-driven, not polled.** The previous design scanned `/proc/<pid>/cmdline` every 2 s looking for
  * the keystore pid. This one blocks on [ServiceManager.waitForService] until the keystore binder
  * appears, registers a binder [IBinder.DeathRecipient] on it, injects once, and then parks on a
  * monitor until the recipient fires — i.e. until the keystore process dies. On death it clears the
