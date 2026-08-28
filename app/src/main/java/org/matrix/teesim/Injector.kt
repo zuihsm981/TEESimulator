@@ -1,13 +1,25 @@
 package org.matrix.teesim
 
 import android.os.Build
+import android.os.IBinder
+import android.os.ServiceManager
 import java.io.File
 
 /**
  * Finds the keystore daemon and drives the packaged `inject` binary to load the right interceptor
  * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
- * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so. Re-injects whenever the
- * daemon restarts (new pid).
+ * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so.
+ *
+ * **Event-driven, not polled.** The previous design scanned `/proc/*/cmdline` every 2 s looking for
+ * the keystore pid. This one blocks on [ServiceManager.waitForService] until the keystore binder
+ * appears, registers a binder [IBinder.DeathRecipient] on it, injects once, and then parks on a
+ * monitor until the recipient fires — i.e. until the keystore process dies. On death it clears the
+ * stale pid and loops back to `waitForService` for the respawn. There is no `/proc` scanning loop and
+ * no sleep-based polling while a keystore is live and injected; the only `findPid` call is the single
+ * one made after a service (re)appears, to turn the binder handle into a pid for the inject binary.
+ *
+ * The only sleeps left are: a 2 s back-off on the no-service / inject-failed branch (a fault-retry,
+ * not a watch poll), and the existing ~12 s `confirmAsync` hello wait (unchanged).
  */
 class Injector(private val moduleDir: File) {
 
@@ -23,6 +35,29 @@ class Injector(private val moduleDir: File) {
 
     @Volatile private var running = false
     @Volatile private var lastPid = -1
+
+    // The keystore service name ServiceManager resolves for this Android generation.
+    private val serviceName: String =
+        if (api >= 31) "android.system.keystore2.IKeystoreService/default"
+        else "android.security.keystore"
+
+    // Wakes the loop when the live keystore service dies so it can re-enter waitForService for the
+    // respawn. Parked on only after a successful inject; a successful inject never polls.
+    private val deathLock = Object()
+
+    private val deathRecipient = object : IBinder.DeathRecipient {
+        override fun binderDied() {
+            // Fires on a binder thread when the keystore process hosting the service exits. Wake the
+            // loop so it drops the stale pid and blocks on waitForService again for the respawn.
+            SystemLogger.info("injector: $procName service died; awaiting respawn")
+            SystemLogger.debug("injector: binderDied() on thread=${Thread.currentThread().name}; clearing lastPid=$lastPid")
+            lastPid = -1
+            synchronized(deathLock) {
+                deathLock.notifyAll()
+                SystemLogger.debug("injector: deathLock notified; loop will re-enter waitForService")
+            }
+        }
+    }
 
     fun start() {
         if (running) return
@@ -41,41 +76,106 @@ class Injector(private val moduleDir: File) {
     }
 
     private fun loop() {
-        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
-        var failures = 0
+        SystemLogger.info("injector: event-driven watch of $procName (abi=$abi lib=$libName)")
         while (running) {
-            val pid = findPid(procName)
-            // Tell the log tail which process to capture, so the Logs panel shows the
-            // target keystore's own output — even before we manage to inject it.
-            LogTail.targetPid = if (pid > 0) pid else -1
-            if (pid > 0 && pid != lastPid && serviceReady()) {
-                if (inject(pid)) {
-                    lastPid = pid
-                    failures = 0
-                    SystemLogger.info("injector: injected into $procName pid=$pid")
-                    confirmAsync(pid)
-                } else {
-                    failures++
-                    SystemLogger.warning("injector: injection into pid=$pid failed; will retry")
+            // Block until the keystore service is registered. waitForService is itself event-driven
+            // (it parks on the binder death/registration path internally), so this is not a poll.
+            SystemLogger.debug("injector: loop: blocking on waitForService($serviceName)")
+            val binder = waitForService()
+            if (!running) return
+            SystemLogger.debug("injector: waitForService returned ${if (binder != null) "binder" else "null"}")
+            if (binder == null) {
+                // waitForService unavailable (stripped build / very old API) — fall back to a single
+                // getService, and if that is also missing, back off briefly. This is the only sleep on
+                // the no-service branch, not a watch poll.
+                SystemLogger.debug("injector: waitForService null; falling back to getService($serviceName)")
+                val got = try { ServiceManager.getService(serviceName) } catch (_: Throwable) { null }
+                if (got == null) {
+                    SystemLogger.warning("injector: $procName service unavailable; retrying")
+                    sleep(2000)
+                    continue
                 }
-            } else if (pid <= 0) {
-                lastPid = -1 // process gone; force re-inject when it returns
+                if (!injectOnce(got)) backoffOnFault(got) else parkUntilDeath()
+            } else {
+                if (!injectOnce(binder)) backoffOnFault(binder) else parkUntilDeath()
             }
-            // Back off when injection keeps failing so we don't hammer a wedged keystore.
-            sleep(if (failures > 3) 10000 else 2000)
+        }
+        SystemLogger.debug("injector: loop exiting (running=$running)")
+    }
+
+    /**
+     * Link the death recipient, resolve the pid once, inject, and confirm. Returns true when the
+     * interceptor is live in [lastPid] (the caller then parks on the death event); false on any fault
+     * (pid not found / inject binary failed), in which case the caller backs off and retries.
+     */
+    private fun injectOnce(binder: IBinder): Boolean {
+        // Register for death first so a race between inject and a crash still wakes the loop.
+        var linked = false
+        try {
+            binder.linkToDeath(deathRecipient, 0)
+            linked = true
+            SystemLogger.debug("injector: linkToDeath registered on $procName service")
+        } catch (e: Exception) {
+            SystemLogger.warning("injector: linkToDeath failed: ${e.message}")
+        }
+
+        val pid = findPid(procName)
+        SystemLogger.debug("injector: findPid($procName) -> $pid (lastPid=$lastPid)")
+        // Tell the log tail which process to capture, so the Logs panel shows the target keystore's
+        // own output — even before we manage to inject it.
+        LogTail.targetPid = if (pid > 0) pid else -1
+        if (pid <= 0) {
+            SystemLogger.warning("injector: $procName service up but pid not found; will retry")
+            return false
+        }
+        if (pid == lastPid) {
+            SystemLogger.debug("injector: pid=$pid == lastPid; already injected, parking")
+            return true // already injected this pid; treat as success (park)
+        }
+        if (inject(pid)) {
+            lastPid = pid
+            SystemLogger.info("injector: injected into $procName pid=$pid")
+            confirmAsync(pid)
+            return true
+        } else {
+            SystemLogger.warning("injector: injection into pid=$pid failed; will retry")
+            return false
         }
     }
 
-    /** keystore forks before it registers its binder; wait for the service so we don't
-     * inject into a half-initialised process. */
-    private fun serviceReady(): Boolean {
-        val name =
-            if (api >= 31) "android.system.keystore2.IKeystoreService/default"
-            else "android.security.keystore"
+    /** Park on the death monitor until the keystore service dies. No polling while injected. */
+    private fun parkUntilDeath() {
+        SystemLogger.debug("injector: parkUntilDeath enter (lastPid=$lastPid); zero-CPU until $procName dies")
+        synchronized(deathLock) {
+            // lastPid is cleared by the death recipient; any spurious wake re-checks and parks again.
+            while (running && lastPid != -1) {
+                deathLock.wait()
+            }
+        }
+        SystemLogger.debug("injector: parkUntilDeath exit (lastPid=$lastPid, running=$running); re-entering waitForService")
+    }
+
+    /** A fault (no pid / inject failed): back off, unlink the recipient we just linked, and retry. */
+    private fun backoffOnFault(binder: IBinder) {
+        SystemLogger.debug("injector: backoffOnFault (fault retry, not a poll); sleeping 2s then unlinking")
+        sleep(2000)
+        // unlink so a re-inject re-links cleanly against the same still-live service.
+        try { binder.unlinkToDeath(deathRecipient, 0) } catch (_: Exception) {}
+    }
+
+    /**
+     * Block until the keystore service is registered, returning its binder or null when unavailable.
+     * Uses ServiceManager.waitForService (event-driven) where present; the caller falls back to
+     * getService on a null return.
+     */
+    private fun waitForService(): IBinder? {
         return try {
-            android.os.ServiceManager.getService(name) != null
+            ServiceManager.waitForService(serviceName)
         } catch (e: Throwable) {
-            true // can't check (stub / older API): don't block injection
+            // Some ROMs throw on a service that never appears; treat as "unavailable" and let the
+            // caller's getService fallback handle it.
+            SystemLogger.debug("injector: waitForService threw ${e.javaClass.simpleName}: ${e.message}; falling back")
+            null
         }
     }
 
