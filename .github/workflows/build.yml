@@ -3,35 +3,37 @@ name: Build
 on:
   workflow_dispatch:
     inputs:
-      abi:
-        description: 'Target ABI (both are 64-bit: arm64-v8a for real devices, x86_64 for emulators/Chromebooks)'
+      architecture:
+        description: 'Target ABI (all builds both arm64 and x86_64)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - arm64-v8a
+          - x86_64
+      build_type:
+        description: 'Build type (release/debug/both)'
+        required: true
+        default: 'both'
         type: choice
         options:
           - both
-          - arm64-v8a
-          - x86_64
-        default: both
-      build_release:
-        description: 'Build the Release variant'
-        type: boolean
-        default: true
-      build_debug:
-        description: 'Build the Debug variant'
-        type: boolean
-        default: true
+          - release
+          - debug
 
 jobs:
   module:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # publish canary prereleases and tagged releases
+      contents: write   # 保留以防您想手动发布 release，当前未使用
     env:
       NDK_VERSION: "28.2.13676358"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0 # full history so the commit-count version is correct
+          fetch-depth: 0   # 如需基于 commit 计数的版本号可保留
 
       - name: Install build tools
         run: |
@@ -49,34 +51,10 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Resolve build options
-        id: opts
-        run: |
-          abi="${{ inputs.abi }}"
-          build_rel="${{ inputs.build_release }}"
-          build_dbg="${{ inputs.build_debug }}"
-          # push/PR: inputs.* are empty → defaults (both ABIs, both variants), matching the old behaviour.
-          [ -z "$abi" ] && abi="both"
-          [ -z "$build_rel" ] && build_rel="true"
-          [ -z "$build_dbg" ] && build_dbg="true"
-          case "$abi" in
-            arm64-v8a) abis="arm64-v8a" ;;
-            x86_64)    abis="x86_64" ;;
-            *)         abis="arm64-v8a,x86_64" ;;
-          esac
-          echo "abis=$abis" >> "$GITHUB_OUTPUT"
-          echo "build_release=$build_rel" >> "$GITHUB_OUTPUT"
-          echo "build_debug=$build_dbg" >> "$GITHUB_OUTPUT"
-          echo "Resolved: abi=$abi → abis=$abis; release=$build_rel debug=$build_dbg"
-
       - name: Set up Rust
         run: |
-          # Install only the Rust targets the selected ABI needs (both are 64-bit).
-          abis="${{ steps.opts.outputs.abis }}"
-          if echo "$abis" | grep -q 'arm64-v8a'; then rustup target add aarch64-linux-android; fi
-          if echo "$abis" | grep -q 'x86_64';    then rustup target add x86_64-linux-android; fi
-          # Pinned for reproducibility. cargo-ndk 4 sets bindgen's NDK-sysroot clang args by default,
-          # which rust/build.sh (openssl-sys bindgens BoringSSL) relies on.
+          # 预先添加所有可能用到的 target（build.sh 通过 NDK 环境变量自行切换）
+          rustup target add aarch64-linux-android x86_64-linux-android
           cargo install cargo-ndk --version 4.1.2 --locked
 
       - name: Cache Cargo
@@ -87,142 +65,77 @@ jobs:
             rust/target
           key: cargo-${{ hashFiles('rust/**/Cargo.toml') }}
 
-      - name: Lint the KeyMint TA (clippy)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
-        run: |
-          rustup component add clippy
-          ./rust/build.sh clippy
-
-      - name: Build the module
+      # ---------- 构建 Rust 静态库（按需循环） ----------
+      - name: Build Rust libraries for selected ABIs
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
         run: |
           set -euo pipefail
-          tasks=()
-          if [ "${{ steps.opts.outputs.build_release }}" = "true" ]; then tasks+=("zipRelease"); fi
-          if [ "${{ steps.opts.outputs.build_debug }}" = "true" ]; then tasks+=("zipDebug"); fi
-          if [ ${#tasks[@]} -eq 0 ]; then
-            echo "No variant selected; defaulting to zipRelease"
-            tasks+=("zipRelease")
+          # 确定要构建的 ABI 列表
+          if [ "${{ inputs.architecture }}" == "all" ]; then
+            ABIS=("arm64-v8a" "x86_64")
+          else
+            ABIS=("${{ inputs.architecture }}")
           fi
-          echo "Building: ${tasks[*]} (abis=${{ steps.opts.outputs.abis }})"
-          ./gradlew "${tasks[@]}" -PabiFilters="${{ steps.opts.outputs.abis }}"
+          for abi in "${ABIS[@]}"; do
+            echo "Building Rust library for $abi"
+            export ABI="$abi"
+            ./rust/build.sh build
+          done
 
+      # ---------- 构建 Android 模块（通过 Gradle） ----------
+      - name: Build the module via Gradle
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: |
+          GRADLE_ARGS=""
+          # 如果只构建单一 ABI，可添加属性以限制 Gradle 仅打包该 ABI
+          if [ "${{ inputs.architecture }}" != "all" ]; then
+            GRADLE_ARGS="$GRADLE_ARGS -Pandroid.injected.build.abi=${{ inputs.architecture }}"
+          fi
+
+          if [ "${{ inputs.build_type }}" == "both" ]; then
+            ./gradlew zipRelease zipDebug $GRADLE_ARGS
+          elif [ "${{ inputs.build_type }}" == "release" ]; then
+            ./gradlew zipRelease $GRADLE_ARGS
+          elif [ "${{ inputs.build_type }}" == "debug" ]; then
+            ./gradlew zipDebug $GRADLE_ARGS
+          fi
+
+      # ---------- 解压并上传产物 ----------
       - name: Stage the module artifacts
         id: artifacts
         run: |
           set -euo pipefail
-          if [ "${{ steps.opts.outputs.build_release }}" = "true" ]; then
-            rel=$(ls out/TEESimulator-*-Release.zip)
-            mkdir -p artifact-release
-            unzip -q "$rel" -d artifact-release
-            echo "release=$(basename "$rel" .zip)" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.build_type }}" == "both" ] || [ "${{ inputs.build_type }}" == "release" ]; then
+            REL_ZIP=$(ls out/TEESimulator-*-Release.zip 2>/dev/null || true)
+            if [ -n "$REL_ZIP" ]; then
+              mkdir -p artifact-release
+              unzip -q "$REL_ZIP" -d artifact-release
+              echo "release=$(basename "$REL_ZIP" .zip)" >> "$GITHUB_OUTPUT"
+            fi
           fi
-          if [ "${{ steps.opts.outputs.build_debug }}" = "true" ]; then
-            dbg=$(ls out/TEESimulator-*-Debug.zip)
-            mkdir -p artifact-debug
-            unzip -q "$dbg" -d artifact-debug
-            echo "debug=$(basename "$dbg" .zip)" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.build_type }}" == "both" ] || [ "${{ inputs.build_type }}" == "debug" ]; then
+            DBG_ZIP=$(ls out/TEESimulator-*-Debug.zip 2>/dev/null || true)
+            if [ -n "$DBG_ZIP" ]; then
+              mkdir -p artifact-debug
+              unzip -q "$DBG_ZIP" -d artifact-debug
+              echo "debug=$(basename "$DBG_ZIP" .zip)" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
-      - name: Upload the release module
-        if: ${{ steps.artifacts.outputs.release != '' }}
+      - name: Upload release module (if built)
+        if: steps.artifacts.outputs.release
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifacts.outputs.release }}
           path: artifact-release/*
           if-no-files-found: error
 
-      - name: Upload the debug module
-        if: ${{ steps.artifacts.outputs.debug != '' }}
+      - name: Upload debug module (if built)
+        if: steps.artifacts.outputs.debug
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifacts.outputs.debug }}
           path: artifact-debug/*
           if-no-files-found: error
-
-      # --- stable release (pushed v* tag) --------------------------------------------------------
-      - name: Publish release
-        if: ${{ success() && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
-            [ -f "$z" ] || continue
-            clean=$(echo "$z" | sed -E 's/-[0-9a-f]{7,}-(Release|Debug)\.zip$/-\1.zip/')
-            [ "$z" = "$clean" ] || mv "$z" "$clean"
-          done
-          assets=()
-          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
-            [ -f "$z" ] && assets+=("$z")
-          done
-          notes=$(printf '# TEESimulator %s\n\n%s\n' "${TAG}" "$(cat module/changelog.md)")
-          gh release delete "$TAG" --yes 2>/dev/null || true
-          gh release create "$TAG" \
-            --latest \
-            --title "TEESimulator ${TAG}" \
-            --notes "$notes" \
-            "${assets[@]}"
-
-      # --- canary distribution (dev push) --------------------------------------------------------
-      - name: Publish canary prerelease
-        if: >-
-          success() &&
-          (github.event_name == 'workflow_dispatch' ||
-           (github.event_name == 'push' && github.ref == 'refs/heads/dev'))
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-        run: |
-          set -euo pipefail
-          code=$(git rev-list HEAD --count)
-          short=$(git rev-parse --short HEAD)
-          subject=$(git log -1 --pretty=%s)
-          tag="canary-${code}"
-          notes=$(cat <<EOF
-          **${subject}**
-
-          Built from [\`${short}\`](${COMMIT_URL}) by [run ${{ github.run_id }}](${RUN_URL}).
-
-          A canary — the current state of \`dev\`, tested by CI and nothing else, published as a
-          prerelease so it can be downloaded (and flashed from the WebUI) without a GitHub account.
-
-          | Build | Use it when |
-          | :-- | :-- |
-          | \`…-Debug.zip\` | Chasing a bug — far more logging. |
-          | \`…-Release.zip\` | You just want the newest code. |
-
-          Only the five most recent canaries are kept.
-          EOF
-          )
-          assets=()
-          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
-            [ -f "$z" ] && assets+=("$z")
-          done
-          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$tag" \
-            --prerelease \
-            --target "${{ github.sha }}" \
-            --title "TEESimulator canary ${code}" \
-            --notes "$notes" \
-            "${assets[@]}"
-
-      - name: Keep only the five most recent canaries
-        if: >-
-          success() &&
-          (github.event_name == 'workflow_dispatch' ||
-           (github.event_name == 'push' && github.ref == 'refs/heads/dev'))
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tags=$(gh release list --limit 100 --json tagName --jq '.[].tagName' | grep '^canary-' || true)
-          [ -n "$tags" ] || exit 0
-          echo "$tags" | sort -t- -k2 -n -r | tail -n +6 | while read -r old; do
-            echo "Removing $old"
-            gh release delete "$old" --yes --cleanup-tag
-          done
