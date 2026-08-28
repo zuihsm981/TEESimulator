@@ -250,11 +250,17 @@ void Logcat::Run() {
 
 extern "C" JNIEXPORT void JNICALL Java_org_matrix_teesim_LogTail_nativeRun(JNIEnv* env, jobject,
                                                                            jstring dir) {
-    const char* d = env->GetStringUTFChars(dir, nullptr);
-    std::string dir_s = d ? d : "/data/adb/teesim/log";
-    if (d) env->ReleaseStringUTFChars(dir, d);
-    // Blocks for the life of the daemon; runs on the dedicated Kotlin thread that called it.
-    Logcat(dir_s).Run();
+    // Log capture DISABLED on purpose: return immediately and do nothing. The reader thread in
+    // LogTail.kt (`nativeRun` on the "teesim-logtail" thread) therefore exits right away — it never
+    // attaches to logd, never fills the in-memory ring (so nativePoll/nativeMaxSeq stay empty), and
+    // never creates /data/adb/teesim/log/teesim*.log. The WebUI Logs panel will simply show nothing.
+    // To restore the old behaviour, re-instate the original implementation below.
+    (void)env;
+    (void)dir;
+    // const char* d = env->GetStringUTFChars(dir, nullptr);
+    // std::string dir_s = d ? d : "/data/adb/teesim/log";
+    // if (d) env->ReleaseStringUTFChars(dir, d);
+    // Logcat(dir_s).Run();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_matrix_teesim_LogTail_nativeSetTargetPid(JNIEnv*, jobject,
